@@ -1,46 +1,36 @@
-// The brief's three documents and the catalog probe.
+// The brief, the provider catalog probe, and the candidate model table.
 //
-// A trial's brief (the path in MAKEFUN_PROMPT_FILE) carries three JSON documents, and the prose around
-// them does not matter: this file finds each by its `schema` member.
+// A trial hands the entry one file ($MAKEFUN_PROMPT_FILE) holding three JSON documents, found here by
+// their `schema` member so the surrounding prose does not matter:
 //
-//   - the provider directory (`free-model-aggregator-01/providers/v1`): one row a provider, with its id,
-//     its wire, its auth scheme, the environment variable a real deployment would read the key from, the
-//     key the simulated service takes, and the base path the entry joins to MAKEFUN_ENV_URL. A directory
-//     entry may give an absolute base_url instead of a path; joinBase takes either.
-//   - the quality table (`free-model-aggregator-01/ratings/v1`): each model's public rating in
-//     milli-points, what it can do (tools, vision, JSON mode, context length) and whether it is free. The
-//     scorer ranks an answer by its rating; a paid model is never a legal pick. This baseline reads the
-//     table's capability columns, free flag and rating_milli. Routing ranks free models by that
-//     rating; a paid model is never a legal pick.
-//   - the workload manifest (`free-model-aggregator-01/workload/v1`): the requests the client will send,
-//     in order, each with its api, whether it streams, its weight and the requirements a model must meet
-//     to serve it.
+//   free-model-aggregator-01/providers/v1  the ten free-tier providers: id, name, wire, auth scheme, the
+//                                          key an operator would keep in `key_env`, the key the trial's
+//                                          service takes, and the path its routes hang off.
+//   free-model-aggregator-01/ratings/v1    the quality table: each model's rating in milli-points, its
+//                                          context length, whether it takes tools, images and JSON mode,
+//                                          and whether it is free. A paid model is never a legal pick.
+//   free-model-aggregator-01/workload/v1   the manifest: twenty requests in order, each with its api,
+//                                          whether it streams, its weight and what a model must have.
 //
-// It then probes each provider's catalog route in the provider's own wire:
-//
-//   openai     GET <base>/v1/models          Authorization: Bearer <key>
-//   anthropic  GET <base>/v1/models          x-api-key: <key>, anthropic-version: 2023-06-01
-//   gemini     GET <base>/v1beta/models      x-goog-api-key: <key>
-//
-// A probe that fails (a refused connection, a non-2xx, a body that is not JSON) leaves its provider out of
-// the catalog and gets no traffic; the trial goes on. Everything here is deterministic: no clock, no
-// randomness, so `node main.ts --list` and the register body build the same document (main.ts prints or
-// posts this one object).
+// Every provider is then probed at its own catalog route, in its own wire, and the answers become the one
+// catalog document: the same object `main.ts --list` prints and the register body carries. Nothing here
+// reads a clock or draws a random number, so two runs on the same brief build the same bytes.
 
 import { readFileSync } from 'node:fs';
 
 export type Wire = 'openai' | 'anthropic' | 'gemini';
 export type AuthScheme = 'bearer' | 'x-api-key' | 'x-goog-api-key' | 'none';
+export type ClientApi = 'openai' | 'anthropic';
+
+export type Json = Record<string, unknown>;
+export const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 export const PROVIDERS_SCHEMA = 'free-model-aggregator-01/providers/v1';
 export const RATINGS_SCHEMA = 'free-model-aggregator-01/ratings/v1';
 export const WORKLOAD_SCHEMA = 'free-model-aggregator-01/workload/v1';
 
-export type Json = Record<string, unknown>;
-export const isRecord = (v: unknown): v is Json => v !== null && typeof v === 'object' && !Array.isArray(v);
-
-/** One provider as the brief lists it. `base` is the base path (or absolute URL) its routes hang off. */
-export interface ProviderDirectoryEntry {
+/** One provider as the brief's directory lists it. `base` is its path (`/p/<id>`) or an absolute URL. */
+export interface ProviderEntry {
   id: string;
   name: string;
   wire: Wire;
@@ -50,9 +40,77 @@ export interface ProviderDirectoryEntry {
   key: string;
 }
 
-export interface ProviderDirectory {
-  schema: string;
-  providers: ProviderDirectoryEntry[];
+/** One row of the quality table. */
+export interface RatingRow {
+  model: string;
+  provider: string;
+  rating_milli: number;
+  context_length: number | null;
+  tools: boolean;
+  vision: boolean;
+  json: boolean;
+  free: boolean;
+}
+
+/** What a model can do: the table's row first, the listing's own fields second, null when neither said. */
+export interface Capabilities {
+  context_length: number | null;
+  tools: boolean | null;
+  vision: boolean | null;
+  json: boolean | null;
+}
+
+/** What one request needs before a model may serve it. */
+export interface Requirement {
+  tools?: boolean;
+  vision?: boolean;
+  json?: boolean;
+  min_context?: number;
+}
+
+/** One row of the workload manifest. */
+export interface WorkloadRequest {
+  id: string;
+  api: ClientApi;
+  stream: boolean;
+  weight: 1 | 2;
+  requires: Requirement;
+}
+
+/** One model as a provider's catalog route listed it. */
+export interface ProbedModel {
+  id: string;
+  display_name: string;
+  free: boolean | null;
+  context_length: number | null;
+  tools: boolean | null;
+  vision: boolean | null;
+  json: boolean | null;
+}
+
+/** One provider's catalog probe. */
+export interface Probe {
+  provider: ProviderEntry;
+  ok: boolean;
+  status: number;
+  models: ProbedModel[];
+  error: string | null;
+}
+
+/** A free model that may serve requests, with everything routing needs to weigh it. */
+export interface ModelEntry {
+  provider: ProviderEntry;
+  model: ProbedModel;
+  rating: number;
+  caps: Capabilities;
+}
+
+/** The brief. `ratings` and `workload` are null when the brief did not carry them. */
+export interface Brief {
+  directory: ProviderEntry[];
+  ratings: RatingRow[];
+  workload: WorkloadRequest[] | null;
+  error: string | null;
 }
 
 export interface CatalogModel {
@@ -69,122 +127,33 @@ export interface CatalogProvider {
   models: CatalogModel[];
 }
 
-/** What `--list` prints and what the entry POSTs to /register: the same document, byte for byte. */
-export interface CatalogReport {
+/** The one catalog document: `--list` prints it, the register body carries it. */
+export interface Catalog {
   providers: CatalogProvider[];
 }
 
-/** One row of the sealed quality table (the brief's copy). */
-export interface RatingRow {
-  model: string;
-  provider: string;
-  rating_milli: number;
-  context_length: number | null;
-  tools: boolean;
-  vision: boolean;
-  json: boolean;
-  free: boolean;
-}
+// ---------------------------------------------------------------------------------------------
+// Reading the brief
+// ---------------------------------------------------------------------------------------------
 
-export interface RatingsFile {
-  schema: string;
-  ratings: RatingRow[];
-  best: { id: string; rating_milli: number }[];
-}
-
-/** What one request needs: a model without it cannot serve the request. */
-export interface Requirement {
-  tools?: boolean;
-  vision?: boolean;
-  json?: boolean;
-  min_context?: number;
-}
-
-export interface WorkloadRequest {
-  id: string;
-  api: 'openai' | 'anthropic';
-  stream: boolean;
-  weight: 1 | 2;
-  requires: Requirement;
-}
-
-export interface WorkloadFile {
-  schema: string;
-  manifest: WorkloadRequest[];
-}
-
-/** The brief as the baseline reads it. `error` is set when it could not be read at all. */
-export interface Brief {
-  directory: ProviderDirectory;
-  ratings: RatingsFile | null;
-  workload: WorkloadFile | null;
-  error: string | null;
-}
-
-/** One model as a provider's catalog route listed it; null members are what the listing did not say. */
-export interface ProbedModel {
-  id: string;
-  display_name: string;
-  free: boolean | null;
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
-}
-
-/** One provider's catalog probe: what its route answered, and the models it listed. */
-export interface Probe {
-  provider: ProviderDirectoryEntry;
-  ok: boolean;
-  status: number;
-  models: ProbedModel[];
-  error: string | null;
-}
-
-/** What a model can do, from the listing first and the quality table second (null: neither said). */
-export interface Capabilities {
-  context_length: number | null;
-  tools: boolean | null;
-  vision: boolean | null;
-  json: boolean | null;
-}
-
-/** A base path joined to the env's URL; an absolute base_url is used as it stands. */
-export function joinBase(envUrl: string, base: string): string {
-  const b = base.trim();
-  if (/^https?:\/\//i.test(b)) return b.replace(/\/+$/, '');
-  const prefix = envUrl.replace(/\/+$/, '');
-  if (b === '') return prefix;
-  return `${prefix}${b.startsWith('/') ? '' : '/'}${b.replace(/\/+$/, '')}`;
-}
-
-/** The headers a provider wants its key in. */
-export function authHeaders(auth: AuthScheme, key: string): Record<string, string> {
-  if (key === '') return {};
-  if (auth === 'bearer') return { authorization: `Bearer ${key}` };
-  if (auth === 'x-api-key') return { 'x-api-key': key };
-  if (auth === 'x-goog-api-key') return { 'x-goog-api-key': key };
-  return {};
-}
-
-/** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
+/** Every `{...}` in `text` that parses as a JSON object carrying a string `schema`, in order. */
 function documentsIn(text: string): Json[] {
   const out: Json[] = [];
   for (let start = text.indexOf('{'); start !== -1; start = text.indexOf('{', start + 1)) {
-    const end = objectEnd(text, start);
+    const end = matchingBrace(text, start);
     if (end === -1) continue;
     try {
       const value: unknown = JSON.parse(text.slice(start, end + 1));
       if (isRecord(value) && typeof value.schema === 'string') out.push(value);
     } catch {
-      // Not JSON on its own: look on.
+      // Not a JSON document on its own: keep scanning.
     }
   }
   return out;
 }
 
-/** The index of the `}` closing the object that opens at `start`, or -1; string contents are skipped. */
-function objectEnd(text: string, start: number): number {
+/** The index of the `}` closing the object opened at `start`, skipping string contents; -1 if unbalanced. */
+function matchingBrace(text: string, start: number): number {
   let depth = 0;
   let inString = false;
   for (let i = start; i < text.length; i++) {
@@ -192,7 +161,9 @@ function objectEnd(text: string, start: number): number {
     if (inString) {
       if (ch === '\\') i += 1;
       else if (ch === '"') inString = false;
-    } else if (ch === '"') inString = true;
+      continue;
+    }
+    if (ch === '"') inString = true;
     else if (ch === '{') depth += 1;
     else if (ch === '}') {
       depth -= 1;
@@ -202,41 +173,54 @@ function objectEnd(text: string, start: number): number {
   return -1;
 }
 
-function stringOf(v: unknown): string {
-  return typeof v === 'string' ? v : '';
+const str = (v: unknown): string => (typeof v === 'string' ? v : '');
+const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+const bool = (v: unknown): boolean | null => (typeof v === 'boolean' ? v : null);
+
+function wireOf(v: unknown): Wire | null {
+  return v === 'openai' || v === 'anthropic' || v === 'gemini' ? v : null;
 }
 
-function numberOrNull(v: unknown): number | null {
-  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+function authOf(v: unknown): AuthScheme {
+  if (v === 'bearer' || v === 'x-api-key' || v === 'x-goog-api-key' || v === 'none') return v;
+  return 'bearer';
 }
 
-function boolOrNull(v: unknown): boolean | null {
-  return typeof v === 'boolean' ? v : null;
-}
-
-function providerOf(v: unknown): ProviderDirectoryEntry | null {
+/** The directory row: `path` is what the brief writes; an absolute `base_url` is accepted as well. */
+function providerOf(v: unknown): ProviderEntry | null {
   if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
-  const wire = v.wire === 'openai' || v.wire === 'anthropic' || v.wire === 'gemini' ? v.wire : null;
+  const id = str(v.id);
+  const wire = wireOf(v.wire);
   if (id === '' || wire === null) return null;
-  const auth = v.auth === 'bearer' || v.auth === 'x-api-key' || v.auth === 'x-goog-api-key' || v.auth === 'none' ? v.auth : 'bearer';
-  // The brief's directory writes `path` (/p/<id>, joined to $MAKEFUN_ENV_URL); a directory that spells an
-  // absolute base instead may use base_path, base_url or base. Take the first non-empty, `path` first.
   const base =
-    stringOf(v.path) !== '' ? stringOf(v.path) : stringOf(v.base_path) !== '' ? stringOf(v.base_path) : stringOf(v.base_url) !== '' ? stringOf(v.base_url) : stringOf(v.base);
-  return { id, name: stringOf(v.name) !== '' ? stringOf(v.name) : id, wire, auth, base, key_env: stringOf(v.key_env), key: stringOf(v.key) };
+    str(v.path) !== ''
+      ? str(v.path)
+      : str(v.base_path) !== ''
+        ? str(v.base_path)
+        : str(v.base_url) !== ''
+          ? str(v.base_url)
+          : str(v.base);
+  return {
+    id,
+    name: str(v.name) !== '' ? str(v.name) : id,
+    wire,
+    auth: authOf(v.auth),
+    base,
+    key_env: str(v.key_env),
+    key: str(v.key),
+  };
 }
 
 function ratingOf(v: unknown): RatingRow | null {
   if (!isRecord(v)) return null;
-  const model = stringOf(v.model);
-  const provider = stringOf(v.provider);
+  const model = str(v.model);
+  const provider = str(v.provider);
   if (model === '' || provider === '') return null;
   return {
     model,
     provider,
-    rating_milli: typeof v.rating_milli === 'number' && Number.isFinite(v.rating_milli) ? v.rating_milli : 0,
-    context_length: numberOrNull(v.context_length),
+    rating_milli: num(v.rating_milli) ?? 0,
+    context_length: num(v.context_length),
     tools: v.tools === true,
     vision: v.vision === true,
     json: v.json === true,
@@ -244,119 +228,91 @@ function ratingOf(v: unknown): RatingRow | null {
   };
 }
 
-function workloadRequestOf(v: unknown): WorkloadRequest | null {
+function requirementOf(v: unknown): Requirement {
+  if (!isRecord(v)) return {};
+  const requires: Requirement = {};
+  if (v.tools === true) requires.tools = true;
+  if (v.vision === true) requires.vision = true;
+  if (v.json === true) requires.json = true;
+  const min = num(v.min_context);
+  if (min !== null) requires.min_context = min;
+  return requires;
+}
+
+function workloadRowOf(v: unknown): WorkloadRequest | null {
   if (!isRecord(v)) return null;
-  const id = stringOf(v.id);
+  const id = str(v.id);
   if (id === '') return null;
-  const requires = isRecord(v.requires) ? v.requires : {};
   return {
     id,
     api: v.api === 'anthropic' ? 'anthropic' : 'openai',
     stream: v.stream === true,
     weight: v.weight === 2 ? 2 : 1,
-    requires: {
-      tools: requires.tools === true,
-      vision: requires.vision === true,
-      json: requires.json === true,
-      ...(typeof requires.min_context === 'number' && Number.isFinite(requires.min_context) ? { min_context: requires.min_context } : {}),
-    },
+    requires: requirementOf(v.requires),
   };
 }
 
-/** The brief at `path`, its three documents found by schema. */
+/** The brief at `path`. A brief that cannot be read leaves the directory empty and names why. */
 export function readBrief(path: string): Brief {
-  const directory: ProviderDirectory = { schema: PROVIDERS_SCHEMA, providers: [] };
-  if (path === '') return { directory, ratings: null, workload: null, error: 'MAKEFUN_PROMPT_FILE is not set' };
+  if (path === '') return { directory: [], ratings: [], workload: null, error: 'MAKEFUN_PROMPT_FILE is not set' };
   let text: string;
   try {
     text = readFileSync(path, 'utf8');
   } catch (err) {
-    return { directory, ratings: null, workload: null, error: `cannot read ${path}: ${(err as Error).message}` };
+    return { directory: [], ratings: [], workload: null, error: `cannot read ${path}: ${(err as Error).message}` };
   }
   const docs = documentsIn(text);
-  const directoryDoc = docs.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers)) ?? null;
-  if (directoryDoc === null || !Array.isArray(directoryDoc.providers)) {
-    return { directory, ratings: null, workload: null, error: `the brief at ${path} holds no ${PROVIDERS_SCHEMA} document` };
+  const providersDoc = docs.find((d) => d.schema === PROVIDERS_SCHEMA && Array.isArray(d.providers));
+  if (providersDoc === undefined) {
+    return { directory: [], ratings: [], workload: null, error: `the brief at ${path} carries no ${PROVIDERS_SCHEMA} document` };
   }
-  const providers = directoryDoc.providers.flatMap((v) => {
+  const directory = (providersDoc.providers as unknown[]).flatMap((v) => {
     const p = providerOf(v);
     return p === null ? [] : [p];
   });
-  const ratingsDoc = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings)) ?? null;
-  const ratingRows = ratingsDoc !== null && Array.isArray(ratingsDoc.ratings) ? ratingsDoc.ratings : null;
-  const ratings: RatingsFile | null =
-    ratingsDoc === null || ratingRows === null
-      ? null
-      : {
-          schema: RATINGS_SCHEMA,
-          ratings: ratingRows.flatMap((v) => {
-            const r = ratingOf(v);
-            return r === null ? [] : [r];
-          }),
-          best: Array.isArray(ratingsDoc.best)
-            ? ratingsDoc.best.flatMap((v) => {
-                if (!isRecord(v) || stringOf(v.id) === '') return [];
-                return [{ id: stringOf(v.id), rating_milli: numberOrNull(v.rating_milli) ?? 0 }];
-              })
-            : [],
-        };
-  const workloadDoc = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest)) ?? null;
-  const workload: WorkloadFile | null =
-    workloadDoc === null || !Array.isArray(workloadDoc.manifest)
-      ? null
-      : {
-          schema: WORKLOAD_SCHEMA,
-          manifest: workloadDoc.manifest.flatMap((v) => {
-            const w = workloadRequestOf(v);
-            return w === null ? [] : [w];
-          }),
-        };
-  return { directory: { schema: PROVIDERS_SCHEMA, providers }, ratings, workload, error: null };
+  const ratingsDoc = docs.find((d) => d.schema === RATINGS_SCHEMA && Array.isArray(d.ratings));
+  const ratings = ratingsDoc === undefined ? [] : (ratingsDoc.ratings as unknown[]).flatMap((v) => {
+    const r = ratingOf(v);
+    return r === null ? [] : [r];
+  });
+  const workloadDoc = docs.find((d) => d.schema === WORKLOAD_SCHEMA && Array.isArray(d.manifest));
+  const workload = workloadDoc === undefined ? null : (workloadDoc.manifest as unknown[]).flatMap((v) => {
+    const w = workloadRowOf(v);
+    return w === null ? [] : [w];
+  });
+  return { directory, ratings, workload, error: null };
 }
 
-/** The rating row of one provider's model, when the quality table has one. */
-export function ratingOfModel(ratings: RatingsFile | null, providerId: string, modelId: string): RatingRow | null {
-  if (ratings === null) return null;
-  return ratings.ratings.find((r) => r.provider === providerId && r.model === modelId) ?? null;
+// ---------------------------------------------------------------------------------------------
+// Providers: base URLs, auth headers, the catalog probe
+// ---------------------------------------------------------------------------------------------
+
+/** A provider's base joined to the env's origin; an absolute base is used as it stands. */
+export function joinBase(envUrl: string, base: string): string {
+  const b = base.trim();
+  if (/^https?:\/\//i.test(b)) return b.replace(/\/+$/, '');
+  const origin = envUrl.replace(/\/+$/, '');
+  if (b === '') return origin;
+  return `${origin}${b.startsWith('/') ? '' : '/'}${b.replace(/\/+$/, '')}`;
 }
 
-/**
- * Whether a model is free: the quality table's row where it has one (it is the sealed truth), the
- * listing's own word where it does not, and paid when neither says. A paid model is never routed.
- */
-export function modelFree(model: ProbedModel, row: RatingRow | null): boolean {
-  if (row !== null) return row.free;
-  return model.free ?? false;
+/** The headers a provider wants its key in. Its wire never decides the header: its auth scheme does. */
+export function authHeaders(auth: AuthScheme, key: string): Record<string, string> {
+  if (auth === 'none' || key === '') return {};
+  if (auth === 'bearer') return { authorization: `Bearer ${key}` };
+  if (auth === 'x-api-key') return { 'x-api-key': key };
+  return { 'x-goog-api-key': key };
 }
 
-/** What a model can do: the quality table's row where it has one, the listing's own fields where it does not. */
-export function capabilitiesOf(model: ProbedModel, row: RatingRow | null): Capabilities {
-  return {
-    context_length: row?.context_length ?? model.context_length ?? null,
-    tools: row?.tools ?? model.tools ?? null,
-    vision: row?.vision ?? model.vision ?? null,
-    json: row?.json ?? model.json ?? null,
-  };
-}
-
-/** Whether a model's capabilities meet one request's requirements. An unknown capability never meets one. */
-export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
-  if (requires.tools === true && caps.tools !== true) return false;
-  if (requires.vision === true && caps.vision !== true) return false;
-  if (requires.json === true && caps.json !== true) return false;
-  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
-  return true;
-}
-
-/** A price field of a listing: 0 when every price is zero, null when the listing says nothing about price. */
+/** A price object on a listing: true when every price is zero, null when the listing says nothing. */
 function zeroPriced(v: Json): boolean | null {
   const pricing = isRecord(v.pricing) ? v.pricing : null;
   if (pricing === null) return null;
-  const values = Object.values(pricing).flatMap((x) => {
-    if (typeof x === 'number') return [x];
-    if (typeof x === 'string' && x.trim() !== '') return [Number(x)];
-    return [];
-  });
+  const values: number[] = [];
+  for (const raw of Object.values(pricing)) {
+    if (typeof raw === 'number') values.push(raw);
+    else if (typeof raw === 'string' && raw.trim() !== '') values.push(Number(raw));
+  }
   if (values.length === 0) return null;
   return values.every((n) => Number.isFinite(n) && n === 0);
 }
@@ -364,21 +320,19 @@ function zeroPriced(v: Json): boolean | null {
 /** One model as a listing wrote it, in whichever wire's spelling. */
 function modelIn(wire: Wire, v: unknown): ProbedModel | null {
   if (!isRecord(v)) return null;
-  const id = wire === 'gemini' ? stringOf(v.name).replace(/^models\//, '') : stringOf(v.id);
+  const id = wire === 'gemini' ? str(v.name).replace(/^models\//, '') : str(v.id);
   if (id === '') return null;
-  const context = numberOrNull(v.context_length) ?? numberOrNull(v.context_window) ?? numberOrNull(v.inputTokenLimit);
   return {
     id,
-    display_name: stringOf(v.display_name) !== '' ? stringOf(v.display_name) : stringOf(v.displayName) !== '' ? stringOf(v.displayName) : id,
-    free: boolOrNull(v.free) ?? zeroPriced(v),
-    context_length: context,
-    tools: boolOrNull(v.tools),
-    vision: boolOrNull(v.vision),
-    json: boolOrNull(v.json),
+    display_name: str(v.display_name) !== '' ? str(v.display_name) : str(v.displayName) !== '' ? str(v.displayName) : id,
+    free: bool(v.free) ?? zeroPriced(v),
+    context_length: num(v.context_length) ?? num(v.context_window) ?? num(v.inputTokenLimit),
+    tools: bool(v.tools),
+    vision: bool(v.vision),
+    json: bool(v.json),
   };
 }
 
-/** The models one catalog route's answer listed, in its wire's shape. */
 function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
   if (!isRecord(body)) return [];
   const list = wire === 'gemini' ? body.models : body.data;
@@ -389,8 +343,8 @@ function modelsIn(wire: Wire, body: unknown): ProbedModel[] {
   });
 }
 
-/** Probe one provider's catalog route, in its own wire, tolerating every failure. */
-export async function probeProvider(envUrl: string, provider: ProviderDirectoryEntry, timeoutMs = 5000): Promise<Probe> {
+/** One provider's catalog route, in its own wire. Every failure is tolerated and reported. */
+export async function probeProvider(envUrl: string, provider: ProviderEntry, timeoutMs: number): Promise<Probe> {
   const base = joinBase(envUrl, provider.base);
   const url = provider.wire === 'gemini' ? `${base}/v1beta/models` : `${base}/v1/models`;
   const headers: Record<string, string> = { accept: 'application/json', ...authHeaders(provider.auth, provider.key) };
@@ -405,29 +359,95 @@ export async function probeProvider(envUrl: string, provider: ProviderDirectoryE
   }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Capabilities and requirements
+// ---------------------------------------------------------------------------------------------
+
+export function ratingOfModel(ratings: readonly RatingRow[], providerId: string, modelId: string): RatingRow | null {
+  for (const row of ratings) if (row.provider === providerId && row.model === modelId) return row;
+  return null;
+}
+
+/** Free is the table's word where it has a row (the sealed truth), else the listing's; paid when neither. */
+export function modelFree(model: ProbedModel, row: RatingRow | null): boolean {
+  if (row !== null) return row.free;
+  return model.free === true;
+}
+
+export function capabilitiesOf(model: ProbedModel, row: RatingRow | null): Capabilities {
+  return {
+    context_length: row?.context_length ?? model.context_length,
+    tools: row?.tools ?? model.tools,
+    vision: row?.vision ?? model.vision,
+    json: row?.json ?? model.json,
+  };
+}
+
+/** An unknown capability never meets a requirement. */
+export function meetsRequirements(requires: Requirement, caps: Capabilities): boolean {
+  if (requires.tools === true && caps.tools !== true) return false;
+  if (requires.vision === true && caps.vision !== true) return false;
+  if (requires.json === true && caps.json !== true) return false;
+  if (requires.min_context !== undefined && (caps.context_length === null || caps.context_length < requires.min_context)) return false;
+  return true;
+}
+
+/** Every free model a probe answered with, at the capabilities the table and the listing agree on. */
+export function freeModels(probes: readonly Probe[], ratings: readonly RatingRow[]): ModelEntry[] {
+  const out: ModelEntry[] = [];
+  for (const probe of probes) {
+    if (!probe.ok) continue;
+    for (const model of probe.models) {
+      const row = ratingOfModel(ratings, probe.provider.id, model.id);
+      if (!modelFree(model, row)) continue;
+      out.push({ provider: probe.provider, model, rating: row?.rating_milli ?? 0, caps: capabilitiesOf(model, row) });
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// The catalog document
+// ---------------------------------------------------------------------------------------------
+
+const byText = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
 /**
- * The catalog the probes and the quality table make: every provider that answered, every model it listed.
+ * The one catalog: every provider that answered, every model it listed, each with the free flag.
  *
- * Its base_url is the directory's own path (`/p/<id>`), never the path joined to `envUrl`: the env's
- * origin differs between a live pass and its replay (a fresh loopback port under the process driver, a
- * fresh pod on the k8s layout), and the catalog is part of the state export a replay must reproduce byte
- * for byte. The scorer compares a reported base_url by its path suffix, so the path passes exactly as the
- * joined URL does; the joined URL reaches a provider, the path names it.
+ * `base_url` is the directory's own path, never joined to the env's origin: the env's port differs between
+ * a live pass and its replay, and the catalog is part of the state export a replay must reproduce byte for
+ * byte. The scorer compares a reported base_url by its path suffix, so the path scores as the joined URL
+ * does; the joined URL reaches a provider, the path names it.
  */
-export function buildCatalog(_envUrl: string, probes: readonly Probe[], ratings: RatingsFile | null): CatalogReport {
+export function buildCatalog(probes: readonly Probe[], ratings: readonly RatingRow[]): Catalog {
   const providers: CatalogProvider[] = [];
   for (const probe of probes) {
     if (!probe.ok) continue;
     const seen = new Set<string>();
     const models: CatalogModel[] = [];
-    // Keep each listing's own order: the catalog check compares free-model ids in the provider's order.
-    for (const model of probe.models) {
+    for (const model of [...probe.models].sort((a, b) => byText(a.id, b.id))) {
       if (seen.has(model.id)) continue;
       seen.add(model.id);
       const row = ratingOfModel(ratings, probe.provider.id, model.id);
-      models.push({ id: model.id, free: modelFree(model, row), context_length: row?.context_length ?? model.context_length ?? null });
+      models.push({
+        id: model.id,
+        free: modelFree(model, row),
+        context_length: row?.context_length ?? model.context_length ?? null,
+      });
     }
     providers.push({ id: probe.provider.id, base_url: probe.provider.base, key_env: probe.provider.key_env, wire: probe.provider.wire, models });
   }
   return { providers };
+}
+
+/** The free model ids the catalog registers: what GET /v1/models lists, in both shapes. */
+export function freeModelIds(catalog: Catalog): { id: string; display: string; provider: string }[] {
+  const out: { id: string; display: string; provider: string }[] = [];
+  for (const provider of catalog.providers) {
+    for (const model of provider.models) {
+      if (model.free) out.push({ id: model.id, display: model.id, provider: provider.id });
+    }
+  }
+  return out;
 }
